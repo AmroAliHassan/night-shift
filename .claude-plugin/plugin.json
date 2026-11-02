@@ -1,0 +1,41 @@
+{
+  "name": "night-shift",
+  "version": "0.5.1",
+  "description": "Goodnight and Goodmorning above the prompt: hand the session to Claude as your co-pilot overnight (it decides, logs every decision, keeps going within red lines and a spend cap), then get a full morning report. A sunrise or deep-ocean bar above the prompt with the Goodnight | Goodmorning switch attached inside it, a 4 s cancel window, and a usage row with context and plan meters.",
+  "author": {
+    "name": "MENT design"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "nightCap": {
+      "type": "number",
+      "title": "Night spend cap (US$)",
+      "description": "Claude usage the night shift may spend before it stops itself",
+      "default": 25
+    },
+    "maxTurns": {
+      "type": "number",
+      "title": "Night turn limit",
+      "description": "Most auto-continued turns in one night, as a safety stop",
+      "default": 80
+    },
+    "logFolder": {
+      "type": "string",
+      "title": "Night log folder",
+      "description": "Where the night log and the morning report are written. Empty: a .night-shift folder in the session's project folder.",
+      "default": ""
+    },
+    "showStrip": {
+      "type": "boolean",
+      "title": "Show the strip",
+      "description": "Draw the day/night strip above the prompt (the /goodnight and /goodmorning commands work either way)",
+      "default": true
+    },
+    "usageRow": {
+      "type": "boolean",
+      "title": "Usage row",
+      "description": "Draw the context and plan-window meters, with a Compact button, in the same look as the strip (if you use the skins mod, turn its own band row off to avoid two)",
+      "default": true
+    }
+  }
+}

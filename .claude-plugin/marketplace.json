@@ -1,0 +1,5 @@
+{
+  "name": "night-shift",
+  "owner": { "name": "AmroAliHassan" },
+  "plugins": [{ "name": "night-shift", "source": "./" }]
+}
