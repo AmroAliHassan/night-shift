@@ -42,13 +42,15 @@ In the terminal the same row is drawn as plain text.
 At the prompt of a terminal session:
 
 ```
-/plugin install night-shift --marketplace AmroAliHassan/night-shift
+/plugin marketplace add AmroAliHassan/night-shift
+/plugin install night-shift@night-shift
 ```
 
 From a shell:
 
 ```
-claude plugin install night-shift --marketplace AmroAliHassan/night-shift
+claude plugin marketplace add AmroAliHassan/night-shift
+claude plugin install night-shift@night-shift
 ```
 
 In the desktop app, where `/plugin` does not run:
