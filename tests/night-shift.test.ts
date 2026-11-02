@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { countLog, nightRule, stripParts, stripTree, stripFit, fmtSpan, SUN, SEA, DAY_END, usageSvg, usageTree, limitLabel } from '../hooks/register'
+import { countLog, nightRule, stripParts, stripTree, stripFit, fmtSpan, SUN, SEA, DAY_END, warmPlan, msUntil, fmtWindow, cacheView, dropCacheTaxRow, parseWindow, usageSvg, usageTree, limitLabel } from '../hooks/register'
 import type { Night } from '../types'
 
 const AT = 1_800_000_000_000
@@ -282,3 +282,57 @@ test('the strip fits the band from 60 to 140 columns in every state', async () =
     }
   }
 })
+
+// 0.6.0: smart keep-warm. Auto drives cache-tax's /keepwarm only when it is worth it, and only when the plan changes.
+test('keep warm: Auto warms big sessions and early-ended nights, never during a night, and folds cache-tax’s row', async () => {
+  const now = new Date(2026, 10, 2, 23, 0).getTime()
+  const night = { startedAt: now, costAtStart: 0, turns: 0, steps: 0, decisions: 0, held: 0, log: 'L.md', direction: 'hold' as const, stopped: null }
+  const base = { mode: 'auto' as const, ctx: 120_000, night: null, now, wakeAt: '08:00', current: null }
+  // Big session by day: six hours, then left alone until under three hours remain.
+  expect(warmPlan(base)).toEqual({ arm: 6 * 3600_000, why: 'day' })
+  expect(warmPlan({ ...base, current: { until: now + 5 * 3600_000, why: 'day' } })).toBe('leave')
+  expect(warmPlan({ ...base, current: { until: now + 2 * 3600_000, why: 'day' } })).toEqual({ arm: 6 * 3600_000, why: 'day' })
+  // A small session restarts for cents: nothing to arm.
+  expect(warmPlan({ ...base, ctx: 20_000 })).toBe('leave')
+  // A running night keeps itself warm; one that stopped early is warmed until the wake-up time when that is within eight hours.
+  expect(warmPlan({ ...base, night })).toBe('leave')
+  // 23:00 to 08:00 is nine hours: more pings than a cold restart is worth, so nothing is armed.
+  expect(warmPlan({ ...base, night: { ...night, stopped: 'done' } })).toBe('leave')
+  const late = new Date(2026, 10, 3, 1, 30).getTime()
+  expect(warmPlan({ ...base, now: late, night: { ...night, stopped: 'done' } })).toEqual({ arm: msUntil(late, '08:00'), why: 'night' })
+  // Off stops only a window this mod armed.
+  expect(warmPlan({ ...base, mode: 'off' })).toBe('leave')
+  expect(warmPlan({ ...base, mode: 'off', current: { until: now + 3600_000, why: 'day' } })).toBe('off')
+  expect(fmtWindow(6 * 3600_000)).toBe('6h')
+  expect(fmtWindow(6.5 * 3600_000)).toBe('6h30m')
+  expect(fmtWindow(45 * 60_000)).toBe('45m')
+  expect(cacheView(now, now - 18 * 60_000, null)).toEqual({ state: 'warm', ms: 42 * 60_000 })
+  expect(cacheView(now, now - 2 * 3600_000, null).state).toBe('cold')
+  expect(cacheView(now, now - 2 * 3600_000, { until: now + 3600_000, why: 'day' }).state).toBe('kept')
+  expect(cacheView(now, 0, null).state).toBe('none')
+  // A /keepwarm you typed shows at once, even before this process has seen a turn.
+  expect(cacheView(now, 0, { until: now + 6 * 3600_000, why: 'manual' }).state).toBe('kept')
+  expect(parseWindow('90m')).toBe(90 * 60_000)
+  expect(parseWindow('2h30m')).toBe(150 * 60_000)
+  expect(parseWindow('status')).toBeNull()
+  // cache-tax's own row goes; everything around it stays.
+  const row = { type: 'Box', props: {}, children: [{ type: 'Box', props: {}, children: [] }, { type: 'Text', props: {}, children: [' cache-tax · ', { type: 'Text', props: {}, children: ['warm'] }, ' · keepwarm 5h left'] }] }
+  const rest = { type: 'Box', props: { key: 'savvy' }, children: [{ type: 'Text', props: {}, children: ['LANES'] }] }
+  const out = dropCacheTaxRow({ type: 'Box', props: {}, children: [rest, row] }) as { children: unknown[] }
+  expect(out.children).toEqual([rest])
+})
+
+test('the desktop accepts the usage bar with the cache and the Warm button', async ($, on) => {
+  mock.clock(on, { now: AT })
+  on('ui.render', ($, e) => {
+    const ui = $.ui.resolve(e) as never as Record<string, (p: unknown) => unknown>
+    return usageTree({ Box: ui.Box, Text: ui.Text, Button: ui.Button, Svg: ui.Svg } as never, [{ label: 'context', percent: 64 }, { label: '7d', percent: 63 }], false, 117, true, () => undefined,
+      { mode: 'auto', cache: { state: 'warm', ms: 42 * 60_000 }, onPress: () => undefined }) as never
+  })
+  const ui = await $.ui.mount({ plugin: 'night-shift', component: 'AbovePrompt', requestId: 'band', surface: 'desktop', props: BAND } as never)
+  expect(Boolean(await ui.find({ type: 'Button', text: /Warm: Auto/ }))).toBe(true)
+  expect(Boolean(await ui.find({ type: 'Button', text: /Compact/ }))).toBe(true)
+  expect(Boolean(await ui.find({ type: 'Svg', alt: /cache warm/ }))).toBe(true)
+  await ui.unmount()
+})
+

@@ -31,7 +31,7 @@ type Pending = { to: 'night' | 'morning'; at: number }
 const DONE_RE = /NIGHT-SHIFT:\s*DONE/i
 const BLOCKED_RE = /NIGHT-SHIFT:\s*BLOCKED[:\s]*([^\n]*)/i
 
-type Cfg = { cap: number; maxTurns: number; logFolder: string; showStrip: boolean; usageRow: boolean }
+type Cfg = { cap: number; maxTurns: number; logFolder: string; showStrip: boolean; usageRow: boolean; wakeAt: string }
 
 // --- words -------------------------------------------------------------------
 
@@ -235,6 +235,7 @@ const refreshUsage = async ($: EngineInterface): Promise<void> => {
       ...(context === null ? [] : [{ label: 'context', percent: context }]),
       ...usage.rateLimits.map(l => ({ label: limitLabel(l.kind), percent: Math.round(l.percentUsed) })),
     ]
+    if (typeof c.tokens === 'number') await $.state.set(CONTEXT_TOKENS, c.tokens)
     const before = JSON.stringify((await $.state.get(USAGE))?.value ?? null)
     if (before !== JSON.stringify(meters)) await $.state.set(USAGE, meters)
   } catch {
@@ -322,6 +323,176 @@ const keepGoing = async ($: EngineInterface): Promise<void> => {
   await $.prompt.submit({ text: CONTINUE_TEXT })
 }
 
+// --- keep warm (0.6.0) ---------------------------------------------------------
+// The prompt cache lasts an hour after the last request. The cache-tax mod keeps
+// it warm with one small ping per 50 idle minutes (/keepwarm); this decides when
+// that is worth it and drives /keepwarm for you, from the usage bar's button.
+// A ping reads the cache at a tenth of the input price, and a cold restart
+// writes it at twice: one restart pays for about 20 pings. So Auto warms only:
+// - a big session (50k+ tokens: a small one restarts for cents), for six hours
+//   after your last turn (seven pings at most);
+// - after a night shift that stopped early, until your wake-up time when that is
+//   within eight hours (ten pings), and not at all when it is further off;
+// - never while a night shift runs: its own turns keep the cache warm.
+// /keepwarm is run only when this changes, since each run shows in the chat.
+
+export type WarmMode = 'auto' | 'off'
+export type Warm = { until: number; why: string }
+const WARM = { plugin: 'night-shift', key: 'warm' } as const
+const WARM_MODE = { plugin: 'night-shift', key: 'warmMode' } as const
+const LAST_REQUEST = { plugin: 'night-shift', key: 'lastRequest' } as const
+const CONTEXT_TOKENS = { plugin: 'night-shift', key: 'contextTokens' } as const
+const CAN_WARM = { plugin: 'night-shift', key: 'canWarm' } as const
+const WARM_MODE_KEY = 'warmMode'
+const CACHE_TTL_MS = 60 * 60 * 1000
+const BIG_TOKENS = 50_000
+const DAY_WINDOW_MS = 6 * 60 * 60 * 1000
+const REARM_BELOW_MS = 3 * 60 * 60 * 1000
+const NIGHT_MAX_MS = 8 * 60 * 60 * 1000
+
+/** Milliseconds from `now` to the next `HH:MM` on the local clock. */
+export const msUntil = (now: number, hhmm: string): number => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim())
+  const d = new Date(now)
+  d.setHours(m ? Math.min(23, Number(m[1])) : 8, m ? Math.min(59, Number(m[2])) : 0, 0, 0)
+  if (d.getTime() <= now) d.setDate(d.getDate() + 1)
+  return d.getTime() - now
+}
+
+/** A window as /keepwarm reads it: 6h, 2h30m, 45m. */
+export const fmtWindow = (ms: number): string => {
+  const total = Math.max(1, Math.round(ms / 60000))
+  const h = Math.floor(total / 60)
+  const m = total % 60
+  return h ? `${h}h${m ? `${m}m` : ''}` : `${m}m`
+}
+
+/**
+ * What Auto wants now: a window to arm, 'off', or 'leave' (nothing to change).
+ * `current` is the window this mod armed last, if any.
+ */
+export const warmPlan = (o: { mode: WarmMode; ctx: number; night: Night | null; now: number; wakeAt: string; current: Warm | null }): { arm: number; why: string } | 'off' | 'leave' => {
+  const live = o.current && o.current.until > o.now ? o.current : null
+  if (o.mode === 'off') return live ? 'off' : 'leave'
+  if (o.night && !o.night.stopped) return 'leave'
+  if (o.night && o.night.stopped) {
+    const ms = msUntil(o.now, o.wakeAt)
+    if (ms > NIGHT_MAX_MS) return live ? 'off' : 'leave'
+    return live && live.why === 'night' ? 'leave' : { arm: ms, why: 'night' }
+  }
+  if (o.ctx < BIG_TOKENS) return 'leave'
+  return live && live.until - o.now > REARM_BELOW_MS ? 'leave' : { arm: DAY_WINDOW_MS, why: 'day' }
+}
+
+const warmModeOf = async ($: EngineInterface): Promise<WarmMode> =>
+  ((await $.state.get(WARM_MODE))?.value ?? 'auto') === 'off' ? 'off' : 'auto'
+
+/**
+ * Whether cache-tax's /keepwarm is there (the Warm button drives it, so it shows
+ * only then), and the Warm mode you chose last. Checked once, after the first
+ * turn, not at start: the command list waits on every plugin's start.
+ */
+const checkWarm = async ($: EngineInterface): Promise<boolean> => {
+  const known = (await $.state.get(CAN_WARM))?.value
+  if (typeof known === 'boolean') return known
+  let can = false
+  try {
+    await $.state.set(WARM_MODE, (await $.store.get(WARM_MODE_KEY)) === 'off' ? 'off' : 'auto')
+    can = (await $.command.list()).some(c => c.name === 'keepwarm')
+  } catch {
+    // No list: no button.
+  }
+  await $.state.set(CAN_WARM, can)
+  return can
+}
+
+/** When this mod last ran /keepwarm itself, so its own runs are not read as yours. */
+let ownKeepwarmAt = 0
+
+/** A /keepwarm window as cache-tax reads it (6h, 90m, 2h30m), or null. */
+export const parseWindow = (text: string): number | null => {
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?$/.exec(text.trim())
+  if (!m || (m[1] === undefined && m[2] === undefined)) return null
+  return (Number(m[1] ?? 0) * 60 + Number(m[2] ?? 0)) * 60_000
+}
+
+/** A /keepwarm you typed: the bar shows its window too (off clears it; status changes nothing). */
+const noteKeepwarm = async ($: EngineInterface, args: string): Promise<void> => {
+  const now = await $.clock.now()
+  if (now - ownKeepwarmAt < 10_000) return
+  const word = args.trim().toLowerCase().split(/\s+/)[0] ?? ''
+  if (word === 'off') return void (await $.state.set(WARM, null))
+  const ms = word === '' || word === 'always' ? DAY_WINDOW_MS : parseWindow(word)
+  if (ms) await $.state.set(WARM, { until: now + ms, why: 'manual' })
+}
+
+/** Runs Auto's decision: arms or stops cache-tax's /keepwarm only when the plan changes. */
+export const applyWarm = async ($: EngineInterface, cfg: Cfg): Promise<void> => {
+  if (!(await checkWarm($))) return
+  const now = await $.clock.now()
+  const plan = warmPlan({
+    mode: await warmModeOf($),
+    ctx: Number((await $.state.get(CONTEXT_TOKENS))?.value ?? 0),
+    night: await readNight($),
+    now,
+    wakeAt: cfg.wakeAt,
+    current: ((await $.state.get(WARM))?.value ?? null) as Warm | null,
+  })
+  if (plan === 'leave') return
+  await $.state.set(WARM, plan === 'off' ? null : { until: now + plan.arm, why: plan.why })
+  const args = plan === 'off' ? 'off' : fmtWindow(plan.arm)
+  ownKeepwarmAt = now
+  // A command waits for the session to be idle; run it in a dispatch of its own.
+  $.clock.after(1, () => void $.command.run({ command: 'keepwarm', args }).catch(() => undefined))
+}
+
+/** The Warm button: Auto, or Off (which stops a window this mod armed). */
+const toggleWarm = async ($: EngineInterface, cfg: Cfg): Promise<void> => {
+  const next: WarmMode = (await warmModeOf($)) === 'auto' ? 'off' : 'auto'
+  await $.state.set(WARM_MODE, next)
+  try {
+    await $.store.set(WARM_MODE_KEY, next)
+  } catch {
+    // Remembered for this session only.
+  }
+  await applyWarm($, cfg)
+}
+
+/** The cache as the bar shows it: kept warm (and for how long), warm for N more minutes, cold, or no turn yet. */
+export type CacheView = { state: 'kept' | 'warm' | 'cold' | 'none'; ms: number }
+export const cacheView = (now: number, lastRequest: number, warm: Warm | null): CacheView => {
+  if (warm && warm.until > now) return { state: 'kept', ms: warm.until - now }
+  if (!lastRequest) return { state: 'none', ms: 0 }
+  const left = lastRequest + CACHE_TTL_MS - now
+  return left > 0 ? { state: 'warm', ms: left } : { state: 'cold', ms: 0 }
+}
+
+/** Drops cache-tax's own grey row from the band: the usage bar shows the cache now. */
+export const dropCacheTaxRow = (n: unknown, depth = 0): unknown => {
+  if (depth > 8 || !n || typeof n !== 'object') return n
+  const d = n as { type?: unknown; children?: unknown[] }
+  if (!Array.isArray(d.children)) return n
+  // Exactly cache-tax's row: a Box holding a Text whose first words are " cache-tax · " (never the column that wraps the rest of the band).
+  const isRow = (x: unknown): boolean => {
+    const b = x as typeof d
+    return !!b && typeof b === 'object' && b.type === 'Box' && Array.isArray(b.children) &&
+      b.children.some(t => !!t && typeof t === 'object' && (t as typeof d).type === 'Text' && typeof (t as typeof d).children?.[0] === 'string' && String((t as typeof d).children![0]).includes('cache-tax · '))
+  }
+  // The band is handed back untouched (the same objects) unless the row is really there: only the path to it is rebuilt.
+  let changed = false
+  const kids: unknown[] = []
+  for (const c of d.children) {
+    if (isRow(c)) {
+      changed = true
+      continue
+    }
+    const next = dropCacheTaxRow(c, depth + 1)
+    if (next !== c) changed = true
+    kids.push(next)
+  }
+  return changed ? { ...d, children: kids } : n
+}
+
 // --- drawing (0.5.0, "attached") ---------------------------------------------------
 // Back to the design approved on 1 Nov 2026: one full-width bar with the
 // Goodnight | Goodmorning switch attached inside its right end, the current side
@@ -333,7 +504,7 @@ const keepGoing = async ($: EngineInterface): Promise<void> => {
 // the switch over the 4 s grace; the switch side flips as it lands.
 
 /** The app's buttons in CSS px, measured on the live app (which draws at 120 %); only content widths use them. */
-export const BTN: Record<string, number> = { Goodnight: 90, Goodmorning: 112, 'Hold for me': 98, 'Claude decides': 120, Cancel: 64, Compact: 78 }
+export const BTN: Record<string, number> = { Goodnight: 90, Goodmorning: 112, 'Hold for me': 98, 'Claude decides': 120, Cancel: 64, Compact: 78, 'Warm: Auto': 100 }
 /** The drawings' height: the app's buttons (about 29 px) sit inside with a little of the bar around them. */
 export const ROW_H = 34
 
@@ -695,11 +866,12 @@ export const limitLabel = (kind: string): string => {
 }
 
 /** The meters, w × 34 on the panel's colour (the panel itself is the app's): "65% context" and a gradient bar each. */
-export const usageSvg = (w: number, meters: Meter[], isLight: boolean): string => {
+export const usageSvg = (w: number, meters: Meter[], isLight: boolean, cache: CacheView | null = null): string => {
   const P = PANEL[isLight ? 'light' : 'dark']
   // A gradient bar per meter: the gradient spans the whole track (blue, amber from 80 %, coral from 95 %), so a high reading ends warm.
   let b = leftEdge(w, ROW_H, P.surf) + `<defs><linearGradient id="ns-use" x1="0" x2="1"><stop offset="0" stop-color="${P.ok}"/><stop offset=".7" stop-color="${P.ok}"/><stop offset=".8" stop-color="${P.warn}"/><stop offset=".95" stop-color="${P.bad}"/><stop offset="1" stop-color="${P.bad}"/></linearGradient></defs>`
-  const slot = (w - 8) / Math.max(1, meters.length)
+  const SEG = cache ? 200 : 0
+  const slot = (w - 8 - SEG) / Math.max(1, meters.length)
   meters.forEach((m, i) => {
     const pct = Math.max(0, Math.min(100, Math.round(m.percent)))
     const x = slot * i + 16
@@ -714,11 +886,23 @@ export const usageSvg = (w: number, meters: Meter[], isLight: boolean): string =
     // The fill is the gradient seen through a window the width of the reading.
     if (pct > 0) b += `<svg x="${bx.toFixed(1)}" y="15" width="${Math.max(5, (bw * pct) / 100).toFixed(1)}" height="5" overflow="hidden"><rect width="${bw.toFixed(1)}" height="5" rx="2.5" fill="url(#ns-use)"/></svg>`
   })
+  if (cache) {
+    // The cache: kept warm by cache-tax (and how long), warm for N more minutes, or cold.
+    const x = w - SEG + 6
+    const col = cache.state === 'kept' ? P.ok : cache.state === 'warm' ? (isLight ? '#0F766E' : '#2DD4BF') : cache.state === 'cold' ? P.warn : P.sub
+    const word = cache.state === 'kept' ? 'kept warm' : cache.state === 'warm' ? 'warm' : cache.state === 'cold' ? 'cold' : 'no turn yet'
+    const left = cache.state === 'kept' ? fmtHm(cache.ms) : cache.state === 'warm' ? `${Math.max(1, Math.round(cache.ms / 60000))}m left` : ''
+    b += `<circle cx="${x + 4}" cy="17" r="4" fill="${col}"/>`
+    b += T(x + 14, 22, 'cache', { size: 13, fill: P.sub })
+    const wx = x + 14 + tw('cache', 13) + 6
+    b += T(wx, 22, word, { size: 13, w: 600, fill: col })
+    if (left) b += T(wx + tw(word, 13, 600) + 6, 22, `· ${left}`, { size: 13, fill: P.sub })
+  }
   return svgDoc(w, ROW_H, b)
 }
 
 /** The usage row: one full-line panel the app sizes, the meters drawn on it, [Compact] attached at its right end while Claude is idle. */
-export const usageTree = (el: Els, meters: Meter[], isLight: boolean, cols: number, canCompact: boolean, onCompact: () => void): unknown => {
+export const usageTree = (el: Els, meters: Meter[], isLight: boolean, cols: number, canCompact: boolean, onCompact: () => void, warm: { mode: WarmMode; cache: CacheView; onPress: () => void } | null = null): unknown => {
   const { Box, Text, Button, Svg } = el
   const alt = meters.map(m => `${Math.round(m.percent)}% ${m.label}`).join(', ')
   // Compact keeps its place, dim while Claude works (a press then only says so), so the meters never move.
@@ -726,29 +910,31 @@ export const usageTree = (el: Els, meters: Meter[], isLight: boolean, cols: numb
   if (!Svg) return Box({ key: 'night-shift-usage', flexDirection: 'row', gap: 1, children: [Box({ flexGrow: 1, children: [Text({ dimColor: true, children: [alt] })] }), ...compact] })
   // The meters take the room the band gives, less Compact; what the estimate leaves over is the panel's own colour.
   // bodyColumns × 8 ran up to about 25 px wider than the real band (seen live, 2 Nov), so drawings leave SAFE px to the stretched fill.
-  const W = Math.max(240, Math.floor(Math.max(320, cols * 8) - BTN.Compact - 4 - R - SAFE))
+  const W = Math.max(240, Math.floor(Math.max(320, cols * 8) - BTN.Compact - 4 - (warm ? BTN['Warm: Auto'] + 6 : 0) - R - SAFE))
+  const warmBtn = warm ? [Button({ key: 'night-shift-warm', label: warm.mode === 'auto' ? 'Warm: Auto' : 'Warm: Off', variant: 'secondary', onPress: warm.onPress })] : []
   const P = PANEL[isLight ? 'light' : 'dark']
   return fullBar({ Box, Svg }, {
     key: 'night-shift-usage',
     h: ROW_H,
-    start: Svg({ source: usageSvg(W, meters, isLight), alt, width: W, height: ROW_H }),
+    start: Svg({ source: usageSvg(W, meters, isLight, warm?.cache ?? null), alt: warm ? `${alt}, cache ${warm.cache.state}` : alt, width: W, height: ROW_H }),
     stretch: stretchSvg(ROW_H, P.surf),
     under: P.surf,
     end: P.surf,
-    tail: [...compact, air(Svg, 3)],
+    tail: [...warmBtn, ...(warm ? [air(Svg, 6)] : []), ...compact, air(Svg, 3)],
   })
 }
 
 // --- hooks -------------------------------------------------------------------
 
 export const register: Register = (on, options) => {
-  const opt = options as { nightCap?: number; maxTurns?: number; logFolder?: string; showStrip?: boolean; usageRow?: boolean }
+  const opt = options as { nightCap?: number; maxTurns?: number; logFolder?: string; showStrip?: boolean; usageRow?: boolean; wakeAt?: string }
   const cfg: Cfg = {
     cap: typeof opt.nightCap === 'number' && opt.nightCap > 0 ? opt.nightCap : 25,
     maxTurns: typeof opt.maxTurns === 'number' && opt.maxTurns > 0 ? Math.floor(opt.maxTurns) : 80,
     logFolder: typeof opt.logFolder === 'string' ? opt.logFolder : '',
     showStrip: opt.showStrip !== false,
     usageRow: opt.usageRow !== false,
+    wakeAt: typeof opt.wakeAt === 'string' && /^\d{1,2}:\d{2}$/.test(opt.wakeAt.trim()) ? opt.wakeAt.trim() : '08:00',
   }
 
   on('session.start', async ($, e, next) => {
@@ -776,6 +962,13 @@ export const register: Register = (on, options) => {
   on('classic.SessionStart', { source: ['resume', 'fork'] }, async ($, e, next) => {
     const r = await next(e)
     await restore($)
+    return r
+  })
+
+  // cache-tax answers /keepwarm; the bar notes the window it set.
+  on('command.run', { command: 'keepwarm' }, async ($, e, next) => {
+    const r = await next(e)
+    await noteKeepwarm($, String(e.args ?? '')).catch(() => undefined)
     return r
   })
 
@@ -809,6 +1002,7 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.step', async function* ($, e, next) {
+    if (!e.agentId) await $.state.set(LAST_REQUEST, await $.clock.now())
     const night = await readNight($)
     if (night) await $.state.set(NIGHT, { ...night, steps: night.steps + 1 })
     return yield* next(e)
@@ -816,12 +1010,15 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (!e.agentId) await afterTurn($, cfg, e.answer ?? '', e.isAborted === true).catch(() => undefined)
+    if (!e.agentId) {
+      await afterTurn($, cfg, e.answer ?? '', e.isAborted === true).catch(() => undefined)
+      await applyWarm($, cfg).catch(() => undefined)
+    }
     return r
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const below = await next(e)
+    const below = dropCacheTaxRow(await next(e))
     if (!cfg.showStrip || e.props.hasSurvey) return below
     const night = await readNight($)
     const direction = ((await $.state.get(DIRECTION))?.value ?? 'hold') as Direction
@@ -857,7 +1054,14 @@ export const register: Register = (on, options) => {
     const usageRow = cfg.usageRow && meters.length
       ? usageTree({ Box: ui.Box, Text: ui.Text, Button: ui.Button, ...(e.surface !== 'terminal' && ui.Svg ? { Svg: ui.Svg } : {}) },
           meters, isLight, e.props.bodyColumns || 100, idle,
-          () => void (idle ? compactNow($) : Promise.resolve($.ui.toast('Compact runs once Claude is idle'))).catch(() => undefined))
+          () => void (idle ? compactNow($) : Promise.resolve($.ui.toast('Compact runs once Claude is idle'))).catch(() => undefined),
+          (await $.state.get(CAN_WARM))?.value
+            ? {
+                mode: await warmModeOf($),
+                cache: cacheView(now, Number((await $.state.get(LAST_REQUEST))?.value ?? 0), ((await $.state.get(WARM))?.value ?? null) as Warm | null),
+                onPress: () => void toggleWarm($, cfg).catch(() => undefined),
+              }
+            : null)
       : null
     // Space between our rows lives in small empty drawings, so it is exact.
     const gap = (h: number) => (ui.Svg && e.surface !== 'terminal' ? [ui.Svg({ source: `<svg xmlns="http://www.w3.org/2000/svg" width="8" height="${h}"></svg>`, alt: 'space', width: 8, height: h })] : [])

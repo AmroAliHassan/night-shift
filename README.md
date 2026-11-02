@@ -37,6 +37,23 @@ On the desktop app a bar sits above the prompt:
 
 In the terminal the same row is drawn as plain text.
 
+## Smart keep-warm (with the cache-tax mod)
+
+Claude's prompt cache lasts one hour after the last message. If it runs out, your next message in a big session pays to rebuild it, often a few dollars. The [cache-tax](https://github.com/karanb192/claude-code-mods) mod can keep it warm with one small ping per 50 idle minutes. With cache-tax installed, night-shift decides when that is worth it and does it for you:
+
+- **The usage row shows the cache:** **warm** (with the minutes left), **kept warm** (and for how long), or **cold**.
+- **A Warm button sits beside Compact.** It is on **Auto** by default; press it to switch between Auto and Off. Your choice is remembered.
+- **Auto keeps a session warm only when that costs less than a cold restart.** One restart costs about as much as 20 pings.
+  - **A big session** (50k+ tokens) stays warm for 6 hours after your last message. That is seven pings at most.
+  - **A small session** is left alone: rebuilding it costs cents.
+  - **A night shift that stops early** keeps the cache warm until your wake-up time (`wakeAt`, 08:00 by default) if that is within 8 hours. Further off, it does not bother.
+  - **A running night shift** needs nothing: its own turns keep the cache warm.
+- **cache-tax's own row is folded into this one,** so you see the cache once.
+- **A line in the chat:** Auto shows `/keepwarm` there only when it starts or stops warming, not after every message.
+- **A `/keepwarm` you type** shows in the row too.
+
+Without cache-tax, the row and the button are simply not shown.
+
 ## Install
 
 At the prompt of a terminal session:
@@ -75,5 +92,6 @@ Restart Claude Code afterwards.
 | `logFolder` | empty | Where the night log and morning report go. Empty: a `.night-shift` folder in the session's project. |
 | `showStrip` | on | Draw the bar above the prompt. The commands work either way. |
 | `usageRow` | on | Draw the usage meters and Compact. If you use the skins mod, turn its own band row off (`/skin band off`) to avoid two. |
+| `wakeAt` | 08:00 | When you are usually back after a night; Auto keeps the cache warm until then after a night shift that stopped early. |
 
 Works well with [savvy-teams](https://github.com/AmroAliHassan/savvy-teams), whose progress band sits under the night bar.

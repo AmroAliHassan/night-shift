@@ -1,6 +1,6 @@
 {
   "name": "night-shift",
-  "version": "0.5.1",
+  "version": "0.6.2",
   "description": "Goodnight and Goodmorning above the prompt: hand the session to Claude as your co-pilot overnight (it decides, logs every decision, keeps going within red lines and a spend cap), then get a full morning report. A sunrise or deep-ocean bar above the prompt with the Goodnight | Goodmorning switch attached inside it, a 4 s cancel window, and a usage row with context and plan meters.",
   "author": {
     "name": "MENT design"
@@ -36,6 +36,12 @@
       "title": "Usage row",
       "description": "Draw the context and plan-window meters, with a Compact button, in the same look as the strip (if you use the skins mod, turn its own band row off to avoid two)",
       "default": true
+    },
+    "wakeAt": {
+      "type": "string",
+      "title": "Wake-up time",
+      "description": "When you are usually back after a night (HH:MM). With the Warm button on Auto and the cache-tax mod installed, a night shift that stops early keeps the cache warm until then, if that is within eight hours.",
+      "default": "08:00"
     }
   }
 }

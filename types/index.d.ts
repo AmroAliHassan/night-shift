@@ -40,6 +40,16 @@ declare module 'claude-code' {
       usage: Array<{ label: string; percent: number }>
       /** True while a /compact the usage row started is running. */
       compacting: boolean
+      /** The keep-warm window this mod armed through cache-tax's /keepwarm (until when, and why: day or night), or null. */
+      warm: { until: number; why: string } | null
+      /** Auto or Off, from the usage bar's Warm button. */
+      warmMode: 'auto' | 'off'
+      /** When the main conversation last called the model: the cache lasts an hour from it. */
+      lastRequest: number
+      /** The context's size in tokens, for Auto's big-session rule. */
+      contextTokens: number
+      /** Whether cache-tax's /keepwarm is installed, so the Warm button can drive it. */
+      canWarm: boolean
     }
   }
 }
